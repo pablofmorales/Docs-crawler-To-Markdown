@@ -3,7 +3,12 @@ certifi==2025.1.31
 charset-normalizer==3.4.1
 html2text==2025.4.15
 idna==3.10
+markdown-it-py==3.0.0
+mdurl==0.1.2
+Pygments==2.19.1
 requests==2.32.3
+rich==14.0.0
 soupsieve==2.7
+tqdm==4.67.1
 typing_extensions==4.13.2
 urllib3==2.4.0

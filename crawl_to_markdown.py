@@ -4,17 +4,38 @@ import argparse
 import requests
 import html2text
 import os
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound # Import FeatureNotFound
 from urllib.parse import urlparse, urljoin
 from collections import deque
 import logging
 import re
+import sys
+import time # Import time for potential delays
+import urllib3 # Import urllib3
+
+# Import Rich components
+from rich.logging import RichHandler
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 # --- Configuration ---
-# Set up basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Initialize Rich Console for printing colored/styled text
+console = Console()
+
+# Configure logging using RichHandler
+# This handler automatically formats logs nicely and works with Rich's output
+logging.basicConfig(
+    level=logging.WARNING, # Default level
+    format="%(message)s", # Let RichHandler handle the formatting
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, show_path=False, rich_tracebacks=True, tracebacks_suppress=[requests, urllib3])] # Suppress long tracebacks from requests/urllib3
+)
+logger = logging.getLogger() # Get the root logger
 
 # --- Helper Functions ---
+# (is_valid_url, get_domain, sanitize_filename remain the same)
 
 def is_valid_url(url):
     """Checks if a URL has a valid scheme and network location."""
@@ -26,172 +47,316 @@ def get_domain(url):
     try:
         return urlparse(url).netloc
     except Exception as e:
-        logging.error(f"Could not parse domain for URL '{url}': {e}")
+        logger.error(f"Could not parse domain for URL '{url}': {e}")
         return None
 
 def sanitize_filename(url_path):
     """Creates a safe filename from a URL path."""
-    # Remove scheme and domain if present (should mostly be paths)
     if url_path.startswith(('http://', 'https://')):
         url_path = urlparse(url_path).path
-
-    # Remove leading/trailing slashes and replace others with underscores
     sanitized = url_path.strip('/').replace('/', '_')
-
-    # Remove invalid filename characters
     sanitized = re.sub(r'[<>:"/\\|?*]', '_', sanitized)
-
-    # Handle empty paths (root page)
     if not sanitized:
         return "index"
-
-    # Limit length (optional)
     max_len = 100
     if len(sanitized) > max_len:
         sanitized = sanitized[:max_len]
-
     return sanitized
 
-def fetch_page(url, headers):
-    """Fetches the content of a URL."""
+# (fetch_page, extract_links, convert_to_markdown, save_markdown remain largely the same,
+#  just using logger directly)
+
+def fetch_page(url, headers, get_content=True):
+    """Fetches a URL. Optionally gets only headers or full content."""
+    method = 'GET' if get_content else 'HEAD' # Use HEAD if not getting content
+    logger.debug(f"Fetching URL ({method}): {url}")
     try:
-        response = requests.get(url, headers=headers, timeout=10) # Added timeout
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        # Check content type - only process HTML
-        if 'text/html' in response.headers.get('Content-Type', '').lower():
-            return response.text
+        # Try HEAD first if we don't need content, fallback to GET if HEAD fails/is disallowed
+        if not get_content:
+            try:
+                # Use a slightly shorter timeout for HEAD requests
+                response = requests.request(method, url, headers=headers, timeout=8, allow_redirects=True) # Allow redirects for HEAD
+                response.raise_for_status()
+                # Check content type even for HEAD request if possible
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'text/html' in content_type:
+                     # If HEAD worked and it's HTML, we might still need GET for links
+                     # Let's fetch again with GET but minimal content read
+                     response_get = requests.get(url, headers=headers, timeout=10, stream=True) # Shorter timeout for partial read
+                     response_get.raise_for_status()
+                     # Read a small chunk to parse links, avoid full download
+                     html_chunk = b"" # Initialize as bytes
+                     try:
+                        # Read up to 512KB, should be enough for head + links in most cases
+                        # Use iter_content for better control over streamed reading
+                        for chunk in response_get.iter_content(chunk_size=8192, decode_unicode=False):
+                             html_chunk += chunk
+                             if len(html_chunk) > 512 * 1024:
+                                 logger.debug(f"Reached partial read limit (512KB) for link discovery: {url}")
+                                 break
+                        logger.debug(f"Successfully fetched partial HTML ({len(html_chunk)} bytes) for links from: {url}")
+                        # Decode after reading needed chunks
+                        return html_chunk.decode('utf-8', errors='ignore')
+                     finally:
+                        response_get.close() # Ensure connection is closed
+                else:
+                    logger.debug(f"Skipping non-HTML content ({content_type}) identified via HEAD: {url}")
+                    return None # HEAD successful but not HTML
+            except requests.exceptions.RequestException as head_err:
+                 logger.debug(f"HEAD request failed for {url} ({head_err}), falling back to GET for link discovery.")
+                 # Fall through to GET request below
+
+        # Perform GET request if get_content is True or HEAD failed/skipped
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'text/html' in content_type:
+            logger.debug(f"Successfully fetched full HTML from: {url}")
+            return response.text # Return full content
         else:
-            logging.info(f"Skipping non-HTML content at: {url} (Content-Type: {response.headers.get('Content-Type')})")
+            logger.debug(f"Skipping non-HTML content ({content_type}) at: {url}")
             return None
+
+    except requests.exceptions.Timeout:
+        logger.warning(f"Timeout fetching {url}")
+        return None
+    except requests.exceptions.HTTPError as e:
+        # Log HTTP errors (like 404 Not Found, 403 Forbidden)
+        # Don't log 404 as warning during discovery if verbose is not set
+        log_level = logging.WARNING if e.response.status_code != 404 or logger.isEnabledFor(logging.INFO) else logging.DEBUG
+        logger.log(log_level, f"HTTP error fetching {url}: {e.response.status_code} {e.response.reason}")
+        return None
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching {url}: {e}")
+        logger.warning(f"Fetch error for {url}: {e}")
         return None
     except Exception as e:
-        logging.error(f"An unexpected error occurred fetching {url}: {e}")
+        # Log full error if verbose, otherwise just a summary
+        if logger.isEnabledFor(logging.DEBUG):
+             logger.exception(f"An unexpected error occurred fetching {url}:") # Use logger.exception for traceback
+        else:
+             logger.error(f"An unexpected error occurred fetching {url}: {e}")
         return None
 
-def extract_links(html_content, base_url, target_domain):
+
+def extract_links(html_content, base_url, target_domain, parser_choice='html.parser'):
     """Extracts all valid, same-domain links from HTML content."""
     links = set()
-    soup = BeautifulSoup(html_content, 'html.parser')
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href'].strip()
-        # Join relative URLs with the base URL
-        full_url = urljoin(base_url, href)
-        # Clean URL (remove fragment identifiers like #section)
-        full_url = urlparse(full_url)._replace(fragment="").geturl()
+    if not html_content:
+        return links
+    logger.debug(f"Extracting links from: {base_url} using {parser_choice}")
+    try:
+        # Use the chosen parser ('lxml' or 'html.parser')
+        try:
+             soup = BeautifulSoup(html_content, parser_choice)
+        except FeatureNotFound:
+             logger.warning(f"Parser '{parser_choice}' not found. Falling back to 'html.parser'. Install 'lxml' for potential speed improvements.")
+             soup = BeautifulSoup(html_content, 'html.parser') # Fallback parser
 
-        # Validate the URL and check if it's within the target domain
-        if is_valid_url(full_url) and get_domain(full_url) == target_domain:
-            links.add(full_url)
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href'].strip()
+            if not href or href.startswith('#') or href.lower().startswith(('javascript:', 'mailto:', 'tel:')):
+                 continue # Skip empty, fragment, or non-http links
+
+            full_url = urljoin(base_url, href)
+            parsed_url = urlparse(full_url)
+
+            # Ensure it's http or https before proceeding
+            if parsed_url.scheme not in ['http', 'https']:
+                continue
+
+            full_url = parsed_url._replace(fragment="").geturl() # Remove fragment
+
+            if is_valid_url(full_url) and get_domain(full_url) == target_domain:
+                links.add(full_url)
+
+        logger.debug(f"Found {len(links)} potential same-domain links on {base_url}")
+    except Exception as e:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.exception(f"Error parsing links from {base_url}:")
+        else:
+            logger.error(f"Error parsing links from {base_url}: {e}")
     return links
 
-def convert_to_markdown(html_content):
+def convert_to_markdown(html_content, url):
     """Converts HTML content to Markdown."""
     if not html_content:
         return ""
+    logger.debug(f"Converting HTML to Markdown for: {url}")
     try:
         h = html2text.HTML2Text()
-        # Configure html2text (optional, defaults are often fine)
         h.ignore_links = False
-        h.ignore_images = True # Ignore images for LLM context
-        h.body_width = 0 # Don't wrap lines
-        return h.handle(html_content)
+        h.ignore_images = True
+        h.body_width = 0
+        h.ignore_emphasis = True
+        h.skip_internal_links = True
+        h.ignore_tables = True
+        h.ignore_tags = ('nav', 'footer', 'script', 'style', 'aside', 'header', 'button', 'form', 'input', 'textarea', 'select', 'figure', 'figcaption') # Added figure tags
+        markdown = h.handle(html_content)
+        # Advanced cleaning: remove lines that are likely headers/footers based on link density or common patterns
+        lines = markdown.split('\n')
+        cleaned_lines = [line for line in lines if not (line.count('[') > 2 and len(line) < 150)] # Simple heuristic
+        markdown = '\n'.join(cleaned_lines)
+        markdown = re.sub(r'\n{3,}', '\n\n', markdown).strip() # Collapse excessive newlines
+        logger.debug(f"Conversion successful for: {url}")
+        return markdown
     except Exception as e:
-        logging.error(f"Error converting HTML to Markdown: {e}")
-        return "" # Return empty string on conversion error
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.exception(f"Error converting HTML to Markdown for {url}:")
+        else:
+            logger.error(f"Error converting HTML to Markdown for {url}: {e}")
+        return ""
 
 def save_markdown(markdown_content, url, output_dir):
     """Saves Markdown content to a file named after the URL path."""
-    if not markdown_content:
-        logging.warning(f"No content to save for URL: {url}")
-        return
+    if not markdown_content or not markdown_content.strip():
+        logger.debug(f"No substantial content to save for URL: {url}")
+        return False
 
-    # Create filename based on the URL path
     url_path = urlparse(url).path
     filename_base = sanitize_filename(url_path)
     filename = f"{filename_base}.md"
     filepath = os.path.join(output_dir, filename)
 
+    logger.debug(f"Attempting to save Markdown to: {filepath}")
     try:
-        # Ensure the output directory exists
         os.makedirs(output_dir, exist_ok=True)
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(f"# Source URL: {url}\n\n") # Add source URL as header
-            f.write(markdown_content)
-        logging.info(f"Saved Markdown for {url} to {filepath}")
+            f.write(f"# Source URL: {url}\n\n")
+            f.write(markdown_content.strip())
+        logger.debug(f"Successfully saved: {filepath}")
+        return True
     except IOError as e:
-        logging.error(f"Error saving file {filepath}: {e}")
+        logger.error(f"Error saving file {filepath}: {e}")
+        return False
     except Exception as e:
-        logging.error(f"An unexpected error occurred saving {filepath}: {e}")
+        if logger.isEnabledFor(logging.DEBUG):
+             logger.exception(f"An unexpected error occurred saving {filepath}:")
+        else:
+             logger.error(f"An unexpected error occurred saving {filepath}: {e}")
+        return False
 
+# --- Phase 1: Discovery ---
+def discover_all_links(start_url, target_domain, headers, parser_choice, progress):
+    """Discovers all reachable, unique, same-domain URLs via BFS using Rich Progress."""
+    logger.info("[bold cyan]Phase 1:[/bold cyan] Discovering all reachable URLs...")
 
-# --- Main Crawling Logic ---
-
-def crawl_site(start_url, output_dir, max_pages=100):
-    """Crawls a website starting from start_url and saves pages as Markdown."""
-    if not is_valid_url(start_url):
-        logging.error(f"Invalid start URL provided: {start_url}")
-        return
-
-    target_domain = get_domain(start_url)
-    if not target_domain:
-        logging.error(f"Could not determine domain for start URL: {start_url}")
-        return
-
-    # Use a queue for URLs to visit (FIFO - Breadth-First Search)
     queue = deque([start_url])
-    # Use a set to keep track of visited URLs to avoid loops and re-processing
     visited = {start_url}
-    pages_processed = 0
 
-    # Basic User-Agent
-    headers = {
-        'User-Agent': 'SimpleMarkdownCrawler/1.0 (https://github.com/your-repo; mailto:your-email@example.com)'
-        # Replace with your actual contact info if making public
-    }
+    # Add a task to the Rich Progress object for discovery
+    # Start with total=None for an indeterminate progress bar initially
+    task_id = progress.add_task("[cyan]Discovering...", total=None, start_url=start_url)
+    progress.update(task_id, total=1, completed=0) # Set initial total to 1
 
-    logging.info(f"Starting crawl at: {start_url}")
-    logging.info(f"Target domain: {target_domain}")
-    logging.info(f"Output directory: {output_dir}")
-    logging.info(f"Max pages to crawl: {max_pages}")
-
-    while queue and pages_processed < max_pages:
+    while queue:
         current_url = queue.popleft()
-        logging.info(f"Processing ({pages_processed + 1}/{max_pages}): {current_url}")
+        logger.debug(f"Discovery: Checking {current_url}")
 
-        html_content = fetch_page(current_url, headers)
+        # Fetch minimal content just for links
+        html_content = fetch_page(current_url, headers, get_content=False)
 
         if html_content:
-            # Convert to Markdown and save
-            markdown_content = convert_to_markdown(html_content)
-            save_markdown(markdown_content, current_url, output_dir)
-            pages_processed += 1
-
-            # Find new links on the current page
-            new_links = extract_links(html_content, current_url, target_domain)
-
-            # Add new, unvisited links to the queue
+            # Pass the parser choice to extract_links
+            new_links = extract_links(html_content, current_url, target_domain, parser_choice)
+            added_count = 0
             for link in new_links:
                 if link not in visited:
                     visited.add(link)
                     queue.append(link)
-                    logging.debug(f"Added to queue: {link}")
+                    added_count += 1
+                    # Update total for the progress bar dynamically
+                    progress.update(task_id, total=len(visited))
+
+            # Advance progress only after processing a URL and finding its links
+            progress.advance(task_id)
+
+            if added_count > 0:
+                 logger.debug(f"Discovery: Added {added_count} new links from {current_url}. Total unique: {len(visited)}")
         else:
-            logging.warning(f"Skipping processing due to fetch error or non-HTML content: {current_url}")
+             # Advance progress even if fetch failed, as we processed the queue item
+             progress.advance(task_id)
+
+        # Optional delay to be polite
+        # time.sleep(0.05) # Short delay
+
+    # Mark task as finished (optional, hides elapsed time if desired)
+    # progress.update(task_id, completed=len(visited)) # Mark as fully completed
+    logger.info(f"[bold cyan]Phase 1 Discovery complete.[/bold cyan] Found {len(visited)} unique URLs.")
+    # Return sorted list for potentially more predictable processing order
+    return sorted(list(visited))
 
 
-    logging.info(f"Crawling finished. Processed {pages_processed} pages.")
-    if queue and pages_processed >= max_pages:
-        logging.warning(f"Stopped crawling because max_pages ({max_pages}) limit was reached.")
+# --- Phase 2: Processing ---
+def process_and_save_pages(urls_to_process, output_dir, max_pages, headers, progress):
+    """Fetches, converts, and saves Markdown for the given URLs using Rich Progress."""
+    pages_to_save_count = min(len(urls_to_process), max_pages)
+    if pages_to_save_count == 0:
+        logger.warning("No URLs to process or max_pages is 0.")
+        return 0 # Return 0 pages saved
+
+    logger.info(f"[bold magenta]Phase 2:[/bold magenta] Processing and saving up to {pages_to_save_count} pages...")
+
+    pages_saved = 0
+    # Add a task for the processing phase
+    task_id = progress.add_task("[magenta]Processing...", total=pages_to_save_count)
+
+    for i, current_url in enumerate(urls_to_process):
+        if pages_saved >= max_pages:
+            logger.warning(f"Reached max_pages limit ({max_pages}). Stopping processing.")
+            break # Stop processing more URLs
+
+        # Update description for the current URL being processed (optional)
+        progress.update(task_id, description=f"[magenta]Processing...[/] [dim]{current_url[:70]}...[/]")
+        logger.debug(f"Processing URL ({i+1}/{len(urls_to_process)}): {current_url}")
+
+        # Fetch full content this time
+        html_content = fetch_page(current_url, headers, get_content=True)
+
+        if html_content:
+            markdown_content = convert_to_markdown(html_content, current_url)
+            saved_successfully = save_markdown(markdown_content, current_url, output_dir)
+
+            if saved_successfully:
+                pages_saved += 1
+                # Advance progress only when a page is successfully saved
+                progress.advance(task_id)
+        else:
+            logger.debug(f"Skipping save for {current_url} (no HTML content or fetch error)")
+            # Do not advance progress bar if page wasn't saved
+
+        # Optional delay
+        # time.sleep(0.05)
+
+    # Mark task as finished
+    # progress.update(task_id, completed=pages_saved)
+    logger.info(f"[bold magenta]Phase 2 Processing complete.[/bold magenta] Successfully saved {pages_saved} pages.")
+    return pages_saved
 
 
 # --- Command-Line Interface ---
 
 if __name__ == "__main__":
+    # --- Define the Argument Parser ---
     parser = argparse.ArgumentParser(
-        description="Crawl a website starting from a URL, convert pages to Markdown, and save them."
+        description="Crawl a website starting from a URL, convert pages to Markdown within the same domain, and save them. Performs a discovery phase first.",
+        formatter_class=argparse.RawTextHelpFormatter, # Use RawTextHelpFormatter to preserve formatting in epilog
+        epilog="""\
+[bold]Examples:[/bold]
+  [dim]# Discover all pages, then crawl & save up to 50 pages to 'docs_md'[/]
+  [cyan]%(prog)s https://docs.example.com/ -m 50 -o docs_md[/]
+
+  [dim]# Discover and crawl all pages (up to default 1000 limit) with verbose logging[/]
+  [cyan]%(prog)s https://anothersite.org/start -v[/]
+
+  [dim]# Discover and crawl quietly (no progress bars or logs except errors)[/]
+  [cyan]%(prog)s https://yetanothersite.com/ -q[/]
+
+  [dim]# Use the standard html.parser instead of lxml[/]
+  [cyan]%(prog)s https://someothersite.com/ --parser html.parser[/]
+"""
     )
+
+    # --- Define Arguments ---
     parser.add_argument(
         "start_url",
         metavar="URL",
@@ -207,10 +372,121 @@ if __name__ == "__main__":
         "-m", "--max-pages",
         dest="max_pages",
         type=int,
-        default=100,
-        help="Maximum number of pages to crawl (default: 100)."
+        default=1000, # Increased default max pages
+        help="Maximum number of pages to *save* after discovery (default: 1000)."
     )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Suppress progress bars and warning/info/debug messages (show only errors)."
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show detailed informational and debug logging messages (implies progress bars)."
+    )
+    # Add lxml dependency info to help
+    try:
+        import lxml
+        default_parser = 'lxml'
+        parser_help = "HTML parser ('lxml' or 'html.parser'). (default: lxml)"
+    except ImportError:
+        default_parser = 'html.parser'
+        parser_help = "HTML parser ('html.parser' only; install 'lxml' for potential speed improvements). (default: html.parser)"
+    parser.add_argument('--parser', default=default_parser, choices=['lxml', 'html.parser'], help=parser_help)
 
+
+    # --- Parse Arguments ---
     args = parser.parse_args()
 
-    crawl_site(args.start_url, args.output_dir, args.max_pages)
+    # --- Adjust Logging Level Based on Flags ---
+    log_level = logging.WARNING # Default
+    if args.verbose:
+        log_level = logging.DEBUG # Show DEBUG, INFO, WARNING, ERROR
+    elif args.quiet:
+        log_level = logging.ERROR # Show only ERROR
+        # Disable logging below ERROR level if quiet
+        logging.disable(logging.WARNING)
+
+    logger.setLevel(log_level)
+    # RichHandler automatically respects the logger's level
+
+
+    # --- Main Execution ---
+    # Log start only if verbose
+    logger.info("[bold green]Starting Markdown Crawler...[/]")
+
+    if not is_valid_url(args.start_url):
+        logger.error(f"Invalid start URL provided: {args.start_url}")
+        sys.exit(1) # Exit if start URL is invalid
+
+    target_domain = get_domain(args.start_url)
+    if not target_domain:
+        logger.error(f"Could not determine domain for start URL: {args.start_url}")
+        sys.exit(1) # Exit if domain cannot be determined
+
+    # Define headers used for both phases
+    headers = {
+        'User-Agent': f'SimpleMarkdownCrawler/2.3 (+https://github.com/your-repo/your-crawler)' # Version bump
+        # Consider adding Accept-Language, etc.
+        # 'Accept-Language': 'en-US,en;q=0.9',
+        # 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
+
+    discovered_urls = []
+    pages_actually_saved = 0
+
+    # Define Rich Progress context
+    # This setup provides a spinner, text description, progress bar, percentage, and time estimates
+    progress_columns = (
+        SpinnerColumn(spinner_name="dots"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None), # Auto-width bar
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TextColumn("ETA:"),
+        TimeRemainingColumn(),
+    )
+
+    try:
+        # Use Progress context manager - ensures progress bar is cleaned up
+        # Disable progress bar entirely if quiet mode is on
+        with Progress(*progress_columns, console=console, disable=args.quiet, transient=True) as progress:
+
+            # Phase 1: Discover Links
+            discovered_urls = discover_all_links(args.start_url, target_domain, headers, args.parser, progress)
+
+            # Phase 2: Process and Save Pages
+            if discovered_urls:
+                pages_actually_saved = process_and_save_pages(discovered_urls, args.output_dir, args.max_pages, headers, progress)
+            else:
+                # Log warning only if not quiet
+                if not args.quiet:
+                    logger.warning("No URLs were discovered. Nothing to process.")
+
+        # Log finish only if verbose
+        logger.info("[bold green]Crawler finished normally.[/]")
+
+    except KeyboardInterrupt:
+        # Catch Ctrl+C gracefully
+        console.print("\n[bold yellow]Process interrupted by user. Exiting.[/]")
+        sys.exit(0) # Clean exit
+    except Exception as e:
+         # Log any other unexpected errors
+         logger.exception("[bold red]An unexpected error occurred during the crawl:[/]")
+         sys.exit(1) # Exit with error status
+
+
+    # --- Final Confirmation Message ---
+    # Show final message unless quiet mode is enabled
+    if not args.quiet:
+        # Use Rich Panel for a nicer final message
+        summary_text = Text.assemble(
+            ("Crawler run complete.\n", "white"),
+            ("Discovered: ", "white"), (f"{len(discovered_urls)}", "bold cyan"), (" URLs\n", "white"),
+            ("Saved: ", "white"), (f"{pages_actually_saved}", "bold magenta"), (" pages\n", "white"),
+            ("Output: ", "white"), (f"'{os.path.abspath(args.output_dir)}'", "bold green")
+        )
+        console.print(Panel(summary_text, title="[bold]Summary[/]", border_style="blue", expand=False))
+
+
