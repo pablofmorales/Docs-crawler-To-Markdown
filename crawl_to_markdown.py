@@ -15,14 +15,16 @@ import urllib3 # Import urllib3
 
 # Import Rich components
 from rich.logging import RichHandler
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, TaskID
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
 # --- Configuration ---
 # Initialize Rich Console for printing colored/styled text
-console = Console()
+# Force terminal=True if output is being piped but we still want colors/progress
+console = Console(force_terminal=True) if not sys.stdout.isatty() else Console()
+
 
 # Configure logging using RichHandler
 # This handler automatically formats logs nicely and works with Rich's output
@@ -35,6 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger() # Get the root logger
 
 # --- Helper Functions ---
+
 # (is_valid_url, get_domain, sanitize_filename remain the same)
 
 def is_valid_url(url):
@@ -52,7 +55,7 @@ def get_domain(url):
 
 def sanitize_filename(url_path):
     """Creates a safe filename from a URL path."""
-    if url_path.startswith(('http://', 'https://')):
+    if url_path.startswith(('http://', 'https')):
         url_path = urlparse(url_path).path
     sanitized = url_path.strip('/').replace('/', '_')
     sanitized = re.sub(r'[<>:"/\\|?*]', '_', sanitized)
@@ -69,7 +72,7 @@ def sanitize_filename(url_path):
 def fetch_page(url, headers, get_content=True):
     """Fetches a URL. Optionally gets only headers or full content."""
     method = 'GET' if get_content else 'HEAD' # Use HEAD if not getting content
-    logger.debug(f"Fetching URL ({method}): {url}")
+    logger.debug(f"Fetching URL ({method}): [link={url}]{url}[/link]") # Use Rich link markup
     try:
         # Try HEAD first if we don't need content, fallback to GET if HEAD fails/is disallowed
         if not get_content:
@@ -92,18 +95,18 @@ def fetch_page(url, headers, get_content=True):
                         for chunk in response_get.iter_content(chunk_size=8192, decode_unicode=False):
                              html_chunk += chunk
                              if len(html_chunk) > 512 * 1024:
-                                 logger.debug(f"Reached partial read limit (512KB) for link discovery: {url}")
+                                 logger.debug(f"Reached partial read limit (512KB) for link discovery: [link={url}]{url}[/link]")
                                  break
-                        logger.debug(f"Successfully fetched partial HTML ({len(html_chunk)} bytes) for links from: {url}")
+                        logger.debug(f"Successfully fetched partial HTML ({len(html_chunk)} bytes) for links from: [link={url}]{url}[/link]")
                         # Decode after reading needed chunks
                         return html_chunk.decode('utf-8', errors='ignore')
                      finally:
                         response_get.close() # Ensure connection is closed
                 else:
-                    logger.debug(f"Skipping non-HTML content ({content_type}) identified via HEAD: {url}")
+                    logger.debug(f"Skipping non-HTML content ({content_type}) identified via HEAD: [link={url}]{url}[/link]")
                     return None # HEAD successful but not HTML
             except requests.exceptions.RequestException as head_err:
-                 logger.debug(f"HEAD request failed for {url} ({head_err}), falling back to GET for link discovery.")
+                 logger.debug(f"HEAD request failed for [link={url}]{url}[/link] ({head_err}), falling back to GET for link discovery.")
                  # Fall through to GET request below
 
         # Perform GET request if get_content is True or HEAD failed/skipped
@@ -111,30 +114,30 @@ def fetch_page(url, headers, get_content=True):
         response.raise_for_status()
         content_type = response.headers.get('Content-Type', '').lower()
         if 'text/html' in content_type:
-            logger.debug(f"Successfully fetched full HTML from: {url}")
+            logger.debug(f"Successfully fetched full HTML from: [link={url}]{url}[/link]")
             return response.text # Return full content
         else:
-            logger.debug(f"Skipping non-HTML content ({content_type}) at: {url}")
+            logger.debug(f"Skipping non-HTML content ({content_type}) at: [link={url}]{url}[/link]")
             return None
 
     except requests.exceptions.Timeout:
-        logger.warning(f"Timeout fetching {url}")
+        logger.warning(f"Timeout fetching [link={url}]{url}[/link]")
         return None
     except requests.exceptions.HTTPError as e:
         # Log HTTP errors (like 404 Not Found, 403 Forbidden)
         # Don't log 404 as warning during discovery if verbose is not set
         log_level = logging.WARNING if e.response.status_code != 404 or logger.isEnabledFor(logging.INFO) else logging.DEBUG
-        logger.log(log_level, f"HTTP error fetching {url}: {e.response.status_code} {e.response.reason}")
+        logger.log(log_level, f"HTTP error fetching [link={url}]{url}[/link]: {e.response.status_code} {e.response.reason}")
         return None
     except requests.exceptions.RequestException as e:
-        logger.warning(f"Fetch error for {url}: {e}")
+        logger.warning(f"Fetch error for [link={url}]{url}[/link]: {e}")
         return None
     except Exception as e:
         # Log full error if verbose, otherwise just a summary
         if logger.isEnabledFor(logging.DEBUG):
-             logger.exception(f"An unexpected error occurred fetching {url}:") # Use logger.exception for traceback
+             logger.exception(f"An unexpected error occurred fetching [link={url}]{url}[/link]:") # Use logger.exception for traceback
         else:
-             logger.error(f"An unexpected error occurred fetching {url}: {e}")
+             logger.error(f"An unexpected error occurred fetching [link={url}]{url}[/link]: {e}")
         return None
 
 
@@ -143,13 +146,13 @@ def extract_links(html_content, base_url, target_domain, parser_choice='html.par
     links = set()
     if not html_content:
         return links
-    logger.debug(f"Extracting links from: {base_url} using {parser_choice}")
+    logger.debug(f"Extracting links from: [link={base_url}]{base_url}[/link] using [i]{parser_choice}[/i]")
     try:
         # Use the chosen parser ('lxml' or 'html.parser')
         try:
              soup = BeautifulSoup(html_content, parser_choice)
         except FeatureNotFound:
-             logger.warning(f"Parser '{parser_choice}' not found. Falling back to 'html.parser'. Install 'lxml' for potential speed improvements.")
+             logger.warning(f"Parser '[i]{parser_choice}[/i]' not found. Falling back to '[i]html.parser[/i]'. Install '[b]lxml[/b]' for potential speed improvements.")
              soup = BeautifulSoup(html_content, 'html.parser') # Fallback parser
 
         for a_tag in soup.find_all('a', href=True):
@@ -169,19 +172,19 @@ def extract_links(html_content, base_url, target_domain, parser_choice='html.par
             if is_valid_url(full_url) and get_domain(full_url) == target_domain:
                 links.add(full_url)
 
-        logger.debug(f"Found {len(links)} potential same-domain links on {base_url}")
+        logger.debug(f"Found {len(links)} potential same-domain links on [link={base_url}]{base_url}[/link]")
     except Exception as e:
         if logger.isEnabledFor(logging.DEBUG):
-            logger.exception(f"Error parsing links from {base_url}:")
+            logger.exception(f"Error parsing links from [link={base_url}]{base_url}[/link]:")
         else:
-            logger.error(f"Error parsing links from {base_url}: {e}")
+            logger.error(f"Error parsing links from [link={base_url}]{base_url}[/link]: {e}")
     return links
 
 def convert_to_markdown(html_content, url):
     """Converts HTML content to Markdown."""
     if not html_content:
         return ""
-    logger.debug(f"Converting HTML to Markdown for: {url}")
+    logger.debug(f"Converting HTML to Markdown for: [link={url}]{url}[/link]")
     try:
         h = html2text.HTML2Text()
         h.ignore_links = False
@@ -197,19 +200,19 @@ def convert_to_markdown(html_content, url):
         cleaned_lines = [line for line in lines if not (line.count('[') > 2 and len(line) < 150)] # Simple heuristic
         markdown = '\n'.join(cleaned_lines)
         markdown = re.sub(r'\n{3,}', '\n\n', markdown).strip() # Collapse excessive newlines
-        logger.debug(f"Conversion successful for: {url}")
+        logger.debug(f"Conversion successful for: [link={url}]{url}[/link]")
         return markdown
     except Exception as e:
         if logger.isEnabledFor(logging.DEBUG):
-            logger.exception(f"Error converting HTML to Markdown for {url}:")
+            logger.exception(f"Error converting HTML to Markdown for [link={url}]{url}[/link]:")
         else:
-            logger.error(f"Error converting HTML to Markdown for {url}: {e}")
+            logger.error(f"Error converting HTML to Markdown for [link={url}]{url}[/link]: {e}")
         return ""
 
 def save_markdown(markdown_content, url, output_dir):
     """Saves Markdown content to a file named after the URL path."""
     if not markdown_content or not markdown_content.strip():
-        logger.debug(f"No substantial content to save for URL: {url}")
+        logger.debug(f"No substantial content to save for URL: [link={url}]{url}[/link]")
         return False
 
     url_path = urlparse(url).path
@@ -217,40 +220,47 @@ def save_markdown(markdown_content, url, output_dir):
     filename = f"{filename_base}.md"
     filepath = os.path.join(output_dir, filename)
 
-    logger.debug(f"Attempting to save Markdown to: {filepath}")
+    logger.debug(f"Attempting to save Markdown to: [repr.filename]{filepath}[/]")
     try:
         os.makedirs(output_dir, exist_ok=True)
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(f"# Source URL: {url}\n\n")
             f.write(markdown_content.strip())
-        logger.debug(f"Successfully saved: {filepath}")
+        logger.debug(f"Successfully saved: [repr.filename]{filepath}[/]")
         return True
     except IOError as e:
-        logger.error(f"Error saving file {filepath}: {e}")
+        logger.error(f"Error saving file [repr.filename]{filepath}[/]: {e}")
         return False
     except Exception as e:
         if logger.isEnabledFor(logging.DEBUG):
-             logger.exception(f"An unexpected error occurred saving {filepath}:")
+             logger.exception(f"An unexpected error occurred saving [repr.filename]{filepath}[/]:")
         else:
-             logger.error(f"An unexpected error occurred saving {filepath}: {e}")
+             logger.error(f"An unexpected error occurred saving [repr.filename]{filepath}[/]: {e}")
         return False
 
 # --- Phase 1: Discovery ---
 def discover_all_links(start_url, target_domain, headers, parser_choice, progress):
     """Discovers all reachable, unique, same-domain URLs via BFS using Rich Progress."""
-    logger.info("[bold cyan]Phase 1:[/bold cyan] Discovering all reachable URLs...")
+    # Log start only if verbose
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("[bold cyan]Phase 1:[/bold cyan] Discovering all reachable URLs...")
 
     queue = deque([start_url])
     visited = {start_url}
 
     # Add a task to the Rich Progress object for discovery
-    # Start with total=None for an indeterminate progress bar initially
     task_id = progress.add_task("[cyan]Discovering...", total=None, start_url=start_url)
     progress.update(task_id, total=1, completed=0) # Set initial total to 1
 
     while queue:
         current_url = queue.popleft()
-        logger.debug(f"Discovery: Checking {current_url}")
+        logger.debug(f"Discovery: Checking [link={current_url}]{current_url}[/link]")
+        # Update progress description to show the URL being checked in discovery phase
+        display_url = current_url
+        if len(display_url) > 70: # Simple truncation for display
+            display_url = display_url[:35] + "..." + display_url[-32:]
+        progress.update(task_id, description=f"[cyan]Discovering...[/] [dim link={current_url}]{display_url}[/]")
+
 
         # Fetch minimal content just for links
         html_content = fetch_page(current_url, headers, get_content=False)
@@ -271,7 +281,7 @@ def discover_all_links(start_url, target_domain, headers, parser_choice, progres
             progress.advance(task_id)
 
             if added_count > 0:
-                 logger.debug(f"Discovery: Added {added_count} new links from {current_url}. Total unique: {len(visited)}")
+                 logger.debug(f"Discovery: Added [bold]{added_count}[/] new links from [link={current_url}]{current_url}[/link]. Total unique: [bold]{len(visited)}[/]")
         else:
              # Advance progress even if fetch failed, as we processed the queue item
              progress.advance(task_id)
@@ -279,10 +289,9 @@ def discover_all_links(start_url, target_domain, headers, parser_choice, progres
         # Optional delay to be polite
         # time.sleep(0.05) # Short delay
 
-    # Mark task as finished (optional, hides elapsed time if desired)
-    # progress.update(task_id, completed=len(visited)) # Mark as fully completed
-    logger.info(f"[bold cyan]Phase 1 Discovery complete.[/bold cyan] Found {len(visited)} unique URLs.")
-    # Return sorted list for potentially more predictable processing order
+    # Log completion only if verbose
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(f"[bold cyan]Phase 1 Discovery complete.[/bold cyan] Found [bold]{len(visited)}[/] unique URLs.")
     return sorted(list(visited))
 
 
@@ -294,20 +303,27 @@ def process_and_save_pages(urls_to_process, output_dir, max_pages, headers, prog
         logger.warning("No URLs to process or max_pages is 0.")
         return 0 # Return 0 pages saved
 
-    logger.info(f"[bold magenta]Phase 2:[/bold magenta] Processing and saving up to {pages_to_save_count} pages...")
+    # Log start only if verbose
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(f"[bold magenta]Phase 2:[/bold magenta] Processing and saving up to [bold]{pages_to_save_count}[/] pages...")
 
     pages_saved = 0
-    # Add a task for the processing phase
+    # Add a task for the processing phase - set initial description
     task_id = progress.add_task("[magenta]Processing...", total=pages_to_save_count)
 
     for i, current_url in enumerate(urls_to_process):
         if pages_saved >= max_pages:
-            logger.warning(f"Reached max_pages limit ({max_pages}). Stopping processing.")
+            logger.warning(f"Reached max_pages limit ([bold]{max_pages}[/]). Stopping processing.")
             break # Stop processing more URLs
 
-        # Update description for the current URL being processed (optional)
-        progress.update(task_id, description=f"[magenta]Processing...[/] [dim]{current_url[:70]}...[/]")
-        logger.debug(f"Processing URL ({i+1}/{len(urls_to_process)}): {current_url}")
+        # Update the progress bar description to show the current URL
+        # This makes the URL part of the progress bar line itself
+        display_url = current_url
+        if len(display_url) > 70: # Simple truncation for display
+            display_url = display_url[:35] + "..." + display_url[-32:]
+        progress.update(task_id, description=f"[magenta]Processing {i+1}/{pages_to_save_count}[/] [dim link={current_url}]{display_url}[/]")
+
+        logger.debug(f"Processing URL ({i+1}/{len(urls_to_process)}): [link={current_url}]{current_url}[/link]") # Keep debug log
 
         # Fetch full content this time
         html_content = fetch_page(current_url, headers, get_content=True)
@@ -321,15 +337,15 @@ def process_and_save_pages(urls_to_process, output_dir, max_pages, headers, prog
                 # Advance progress only when a page is successfully saved
                 progress.advance(task_id)
         else:
-            logger.debug(f"Skipping save for {current_url} (no HTML content or fetch error)")
+            logger.debug(f"Skipping save for [link={current_url}]{current_url}[/link] (no HTML content or fetch error)")
             # Do not advance progress bar if page wasn't saved
 
         # Optional delay
         # time.sleep(0.05)
 
-    # Mark task as finished
-    # progress.update(task_id, completed=pages_saved)
-    logger.info(f"[bold magenta]Phase 2 Processing complete.[/bold magenta] Successfully saved {pages_saved} pages.")
+    # Log completion only if verbose
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(f"[bold magenta]Phase 2 Processing complete.[/bold magenta] Successfully saved [bold]{pages_saved}[/] pages.")
     return pages_saved
 
 
@@ -360,6 +376,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "start_url",
         metavar="URL",
+        nargs='?', # Make start_url optional
+        default=None, # Default to None if not provided
         help="The starting URL to crawl (e.g., https://docs.example.com)."
     )
     parser.add_argument(
@@ -396,13 +414,21 @@ if __name__ == "__main__":
     parser.add_argument('--parser', default=default_parser, choices=['lxml', 'html.parser'], help=parser_help)
 
 
-    # --- Parse Arguments ---
+    # --- Initial Argument Check for Default Help ---
     args = parser.parse_args()
+
+    if args.start_url is None:
+         # Use Rich console to print help for better formatting if possible
+         console.print(Panel(parser.format_help(), title="[bold]Help[/]", border_style="yellow"))
+         sys.exit(0)
+
 
     # --- Adjust Logging Level Based on Flags ---
     log_level = logging.WARNING # Default
+    is_quiet = args.quiet
     if args.verbose:
         log_level = logging.DEBUG # Show DEBUG, INFO, WARNING, ERROR
+        is_quiet = False # Verbose overrides quiet for logging/progress
     elif args.quiet:
         log_level = logging.ERROR # Show only ERROR
         # Disable logging below ERROR level if quiet
@@ -413,8 +439,11 @@ if __name__ == "__main__":
 
 
     # --- Main Execution ---
+    # Removed screen clear
+
     # Log start only if verbose
     logger.info("[bold green]Starting Markdown Crawler...[/]")
+    logger.info(f"Target URL: [link={args.start_url}]{args.start_url}[/link]") # Log target URL
 
     if not is_valid_url(args.start_url):
         logger.error(f"Invalid start URL provided: {args.start_url}")
@@ -427,7 +456,7 @@ if __name__ == "__main__":
 
     # Define headers used for both phases
     headers = {
-        'User-Agent': f'SimpleMarkdownCrawler/2.3 (+https://github.com/your-repo/your-crawler)' # Version bump
+        'User-Agent': f'SimpleMarkdownCrawler/2.6 (+https://github.com/your-repo/your-crawler)' # Version bump
         # Consider adding Accept-Language, etc.
         # 'Accept-Language': 'en-US,en;q=0.9',
         # 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
@@ -436,12 +465,12 @@ if __name__ == "__main__":
     discovered_urls = []
     pages_actually_saved = 0
 
-    # Define Rich Progress context
-    # This setup provides a spinner, text description, progress bar, percentage, and time estimates
+    # Define Rich Progress columns (used for both phases)
+    # Keep the description column simple here
     progress_columns = (
         SpinnerColumn(spinner_name="dots"),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=None), # Auto-width bar
+        TextColumn("[progress.description]{task.description}", justify="left"),
+        BarColumn(bar_width=None),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeElapsedColumn(),
         TextColumn("ETA:"),
@@ -449,23 +478,30 @@ if __name__ == "__main__":
     )
 
     try:
-        # Use Progress context manager - ensures progress bar is cleaned up
-        # Disable progress bar entirely if quiet mode is on
-        with Progress(*progress_columns, console=console, disable=args.quiet, transient=True) as progress:
-
-            # Phase 1: Discover Links
+        # --- Phase 1 Execution ---
+        # Use Progress context manager for discovery
+        # Set transient=True so this bar disappears after completion
+        with Progress(*progress_columns, console=console, disable=is_quiet, transient=True) as progress:
             discovered_urls = discover_all_links(args.start_url, target_domain, headers, args.parser, progress)
 
-            # Phase 2: Process and Save Pages
-            if discovered_urls:
-                pages_actually_saved = process_and_save_pages(discovered_urls, args.output_dir, args.max_pages, headers, progress)
-            else:
-                # Log warning only if not quiet
-                if not args.quiet:
-                    logger.warning("No URLs were discovered. Nothing to process.")
+        # --- Phase 2 Execution ---
+        if discovered_urls:
+            # Add a print statement for separation if not quiet
+            if not is_quiet:
+                console.print() # Print a blank line for separation
 
-        # Log finish only if verbose
-        logger.info("[bold green]Crawler finished normally.[/]")
+            # Use a *new* Progress context manager for processing
+            # Set transient=False to keep this bar on screen after completion
+            with Progress(*progress_columns, console=console, disable=is_quiet, transient=False) as progress:
+                pages_actually_saved = process_and_save_pages(discovered_urls, args.output_dir, args.max_pages, headers, progress)
+        else:
+            # Log warning only if not quiet
+            if not is_quiet:
+                logger.warning("No URLs were discovered. Nothing to process.")
+
+        # Log finish only if verbose (and not quiet)
+        if not is_quiet:
+            logger.info("[bold green]Crawler finished normally.[/]")
 
     except KeyboardInterrupt:
         # Catch Ctrl+C gracefully
@@ -479,7 +515,7 @@ if __name__ == "__main__":
 
     # --- Final Confirmation Message ---
     # Show final message unless quiet mode is enabled
-    if not args.quiet:
+    if not is_quiet:
         # Use Rich Panel for a nicer final message
         summary_text = Text.assemble(
             ("Crawler run complete.\n", "white"),
