@@ -357,18 +357,21 @@ if __name__ == "__main__":
         description="Crawl a website starting from a URL, convert pages to Markdown within the same domain, and save them. Performs a discovery phase first.",
         formatter_class=argparse.RawTextHelpFormatter, # Use RawTextHelpFormatter to preserve formatting in epilog
         epilog="""\
-[bold]Examples:[/bold]
-  [dim]# Discover all pages, then crawl & save up to 50 pages to 'docs_md'[/]
-  [cyan]%(prog)s https://docs.example.com/ -m 50 -o docs_md[/]
+[bold]Examples:[/bold]\n
+  [dim]# Process ONLY the single starting URL[/]\n
+  [cyan]%(prog)s https://docs.example.com/intro[/]\n
 
-  [dim]# Discover and crawl all pages (up to default 1000 limit) with verbose logging[/]
-  [cyan]%(prog)s https://anothersite.org/start -v[/]
+  [dim]# Discover all pages, then crawl & save up to 50 pages to 'docs_md'[/]\n
+  [cyan]%(prog)s --all https://docs.example.com/ -m 50 -o docs_md[/]\n
 
-  [dim]# Discover and crawl quietly (no progress bars or logs except errors)[/]
-  [cyan]%(prog)s https://yetanothersite.com/ -q[/]
+  [dim]# Discover and crawl all pages (up to default 1000 limit) with verbose logging[/]\n
+  [cyan]%(prog)s --all https://anothersite.org/start -v[/]\n
 
-  [dim]# Use the standard html.parser instead of lxml[/]
-  [cyan]%(prog)s https://someothersite.com/ --parser html.parser[/]
+  [dim]# Discover and crawl quietly (no progress bars or logs except errors)[/]\n
+  [cyan]%(prog)s --all https://yetanothersite.com/ -q[/]\n
+
+  [dim]# Use the standard html.parser instead of lxml[/]\n
+  [cyan]%(prog)s --all https://someothersite.com/ --parser html.parser[/]\n
 """
     )
 
@@ -378,7 +381,7 @@ if __name__ == "__main__":
         metavar="URL",
         nargs='?', # Make start_url optional
         default=None, # Default to None if not provided
-        help="The starting URL to crawl (e.g., https://docs.example.com)."
+        help="The URL to process. By default, only this single page is processed. Use --all to crawl the entire site starting from this URL."
     )
     parser.add_argument(
         "-o", "--output",
@@ -391,7 +394,12 @@ if __name__ == "__main__":
         dest="max_pages",
         type=int,
         default=1000, # Increased default max pages
-        help="Maximum number of pages to *save* after discovery (default: 1000)."
+        help="Maximum number of pages to *save* when using --all (default: 1000)."
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Crawl the entire website starting from the URL, instead of just processing the single URL."
     )
     parser.add_argument(
         "-q", "--quiet",
@@ -444,6 +452,10 @@ if __name__ == "__main__":
     # Log start only if verbose
     logger.info("[bold green]Starting Markdown Crawler...[/]")
     logger.info(f"Target URL: [link={args.start_url}]{args.start_url}[/link]") # Log target URL
+    if args.all:
+        logger.info("Mode: [bold cyan]Full Site Crawl (--all)[/bold cyan]")
+    else:
+        logger.info("Mode: [bold cyan]Single Page Processing[/bold cyan]")
 
     if not is_valid_url(args.start_url):
         logger.error(f"Invalid start URL provided: {args.start_url}")
@@ -453,6 +465,10 @@ if __name__ == "__main__":
     if not target_domain:
         logger.error(f"Could not determine domain for start URL: {args.start_url}")
         sys.exit(1) # Exit if domain cannot be determined
+
+    # Construct the domain-specific output directory
+    domain_output_dir = os.path.join(args.output_dir, target_domain)
+    logger.info(f"Output directory: [repr.filename]{os.path.abspath(domain_output_dir)}[/]")
 
     # Define headers used for both phases
     headers = {
@@ -465,7 +481,7 @@ if __name__ == "__main__":
     discovered_urls = []
     pages_actually_saved = 0
 
-    # Define Rich Progress columns (used for both phases)
+    # Define Rich Progress columns (used for both phases if --all is used)
     # Keep the description column simple here
     progress_columns = (
         SpinnerColumn(spinner_name="dots"),
@@ -478,26 +494,45 @@ if __name__ == "__main__":
     )
 
     try:
-        # --- Phase 1 Execution ---
-        # Use Progress context manager for discovery
-        # Set transient=True so this bar disappears after completion
-        with Progress(*progress_columns, console=console, disable=is_quiet, transient=True) as progress:
-            discovered_urls = discover_all_links(args.start_url, target_domain, headers, args.parser, progress)
+        if args.all:
+            # --- Phase 1 Execution (Full Crawl) ---
+            # Use Progress context manager for discovery
+            # Set transient=True so this bar disappears after completion
+            with Progress(*progress_columns, console=console, disable=is_quiet, transient=True) as progress:
+                discovered_urls = discover_all_links(args.start_url, target_domain, headers, args.parser, progress)
 
-        # --- Phase 2 Execution ---
-        if discovered_urls:
-            # Add a print statement for separation if not quiet
-            if not is_quiet:
-                console.print() # Print a blank line for separation
+            # --- Phase 2 Execution (Full Crawl) ---
+            if discovered_urls:
+                # Add a print statement for separation if not quiet
+                if not is_quiet:
+                    console.print() # Print a blank line for separation
 
-            # Use a *new* Progress context manager for processing
-            # Set transient=False to keep this bar on screen after completion
-            with Progress(*progress_columns, console=console, disable=is_quiet, transient=False) as progress:
-                pages_actually_saved = process_and_save_pages(discovered_urls, args.output_dir, args.max_pages, headers, progress)
+                # Use a *new* Progress context manager for processing
+                # Set transient=False to keep this bar on screen after completion
+                with Progress(*progress_columns, console=console, disable=is_quiet, transient=False) as progress:
+                    # Pass the domain_output_dir here
+                    pages_actually_saved = process_and_save_pages(discovered_urls, domain_output_dir, args.max_pages, headers, progress)
+            else:
+                # Log warning only if not quiet
+                if not is_quiet:
+                    logger.warning("No URLs were discovered via crawling. Nothing to process.")
         else:
-            # Log warning only if not quiet
-            if not is_quiet:
-                logger.warning("No URLs were discovered. Nothing to process.")
+            # --- Single Page Execution ---
+            logger.info(f"Fetching single page: [link={args.start_url}]{args.start_url}[/link]")
+            html_content = fetch_page(args.start_url, headers, get_content=True)
+            if html_content:
+                logger.info("Converting to Markdown...")
+                markdown_content = convert_to_markdown(html_content, args.start_url)
+                logger.info("Saving Markdown...")
+                # Pass the domain_output_dir here
+                saved_successfully = save_markdown(markdown_content, args.start_url, domain_output_dir)
+                if saved_successfully:
+                    pages_actually_saved = 1
+                    logger.info("Markdown saved successfully.")
+                else:
+                     logger.error("Failed to save Markdown.")
+            else:
+                 logger.warning(f"Could not fetch or process HTML content from the URL: [link={args.start_url}]{args.start_url}[/link]")
 
         # Log finish only if verbose (and not quiet)
         if not is_quiet:
@@ -519,10 +554,17 @@ if __name__ == "__main__":
         # Use Rich Panel for a nicer final message
         summary_text = Text.assemble(
             ("Crawler run complete.\n", "white"),
-            ("Discovered: ", "white"), (f"{len(discovered_urls)}", "bold cyan"), (" URLs\n", "white"),
-            ("Saved: ", "white"), (f"{pages_actually_saved}", "bold magenta"), (" pages\n", "white"),
-            ("Output: ", "white"), (f"'{os.path.abspath(args.output_dir)}'", "bold green")
         )
+        if args.all:
+            summary_text.append_text(Text.assemble(
+                ("Discovered: ", "white"), (f"{len(discovered_urls)}", "bold cyan"), (" URLs\n", "white"),
+            ))
+        summary_text.append_text(Text.assemble(
+            ("Saved: ", "white"), (f"{pages_actually_saved}", "bold magenta"), (" pages\n", "white"),
+            # Update the output path in the summary
+            ("Output: ", "white"), (f"'{os.path.abspath(domain_output_dir)}'", "bold green")
+        ))
+
         console.print(Panel(summary_text, title="[bold]Summary[/]", border_style="blue", expand=False))
 
 
